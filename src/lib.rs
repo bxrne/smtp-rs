@@ -10,3 +10,4 @@ pub mod libsmtp;
 pub use libsmtp::{Broker, Session};
 pub use libsmtp::{Command, Machine, Mail, Reply, State};
 pub use libsmtp::{Error, Result};
+pub use libsmtp::{MemoryTransport, NullTransport, Transport};

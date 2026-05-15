@@ -7,18 +7,21 @@
 use crate::Error;
 use crate::Result;
 use crate::libsmtp::model::{Machine, Reply};
+use crate::libsmtp::transport::{NullTransport, Transport};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 
 /// Handler for individual TCP sessions.
 pub struct Session {
     stream: TcpStream,
+    transport: Arc<dyn Transport>,
 }
 
 impl Session {
     /// Create a new session wrapping the given stream.
-    pub fn new(stream: TcpStream) -> Self {
-        Session { stream }
+    pub fn new(stream: TcpStream, transport: Arc<dyn Transport>) -> Self {
+        Session { stream, transport }
     }
 
     /// Drive the SMTP state machine over this connection until the client
@@ -36,7 +39,11 @@ impl Session {
 
         for line in reader.lines() {
             let line = line.map_err(|e| Error::SessionError(e.to_string()))?;
-            if let Some(reply) = machine.step(&line) {
+            let outcome = machine.step_with_mail(&line);
+            if let Some(mail) = outcome.accepted {
+                self.transport.deliver(mail)?;
+            }
+            if let Some(reply) = outcome.reply {
                 self.write_reply(&reply)?;
             }
             if machine.is_closed() {
@@ -57,13 +64,26 @@ impl Session {
 /// Broker for TCP connections and sessions.
 pub struct Broker {
     listener: TcpListener,
+    transport: Arc<dyn Transport>,
 }
 
 impl Broker {
     /// Create a new broker listening on the specified address.
     pub fn new(addr: &str) -> Result<Self> {
         let listener = TcpListener::bind(addr).map_err(|e| Error::SessionError(e.to_string()))?;
-        Ok(Broker { listener })
+        Ok(Broker {
+            listener,
+            transport: Arc::new(NullTransport),
+        })
+    }
+
+    /// Create a new broker with a custom transport.
+    pub fn new_with_transport(addr: &str, transport: Arc<dyn Transport>) -> Result<Self> {
+        let listener = TcpListener::bind(addr).map_err(|e| Error::SessionError(e.to_string()))?;
+        Ok(Broker {
+            listener,
+            transport,
+        })
     }
 
     /// Return the local socket address the broker is bound to.
@@ -78,7 +98,7 @@ impl Broker {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let mut session = Session::new(stream);
+                    let mut session = Session::new(stream, self.transport.clone());
                     session.handle()?;
                 }
                 Err(e) => return Err(Error::SessionError(e.to_string())),
@@ -136,7 +156,7 @@ mod tests {
                 .listener
                 .accept()
                 .map_err(|e| Error::SessionError(e.to_string()))?;
-            let mut session = Session::new(stream);
+            let mut session = Session::new(stream, broker.transport.clone());
             session.handle()
         });
         (addr, handle)

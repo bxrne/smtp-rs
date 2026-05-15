@@ -120,6 +120,13 @@ pub struct Machine {
     pub last: Option<Mail>,
 }
 
+/// Outcome from driving the state machine with one line of input.
+#[derive(Debug, Default)]
+pub struct StepOutcome {
+    pub reply: Option<Reply>,
+    pub accepted: Option<Mail>,
+}
+
 impl Default for Machine {
     fn default() -> Self {
         Self::new()
@@ -157,25 +164,39 @@ impl Machine {
     /// Returns None for intermediate DATA body lines (which receive no
     /// reply per RFC 821) and Some(reply) otherwise.
     pub fn step(&mut self, line: &str) -> Option<Reply> {
+        self.step_with_mail(line).reply
+    }
+
+    /// Drive the machine and return any accepted mail when DATA completes.
+    pub fn step_with_mail(&mut self, line: &str) -> StepOutcome {
         if self.state == State::Data {
             return self.handle_data_line(line);
         }
-        Some(self.handle_command(Command::parse(line)))
+        StepOutcome {
+            reply: Some(self.handle_command(Command::parse(line))),
+            accepted: None,
+        }
     }
 
-    fn handle_data_line(&mut self, line: &str) -> Option<Reply> {
+    fn handle_data_line(&mut self, line: &str) -> StepOutcome {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed == "." {
             let mail = std::mem::take(&mut self.pending);
-            self.last = Some(mail);
+            self.last = Some(mail.clone());
             self.state = State::Helo;
-            return Some(Reply::new(250, "OK message accepted"));
+            return StepOutcome {
+                reply: Some(Reply::new(250, "OK message accepted")),
+                accepted: Some(mail),
+            };
         }
         // RFC 821 §4.5.2 transparency: leading "." is stripped.
         let payload = trimmed.strip_prefix('.').unwrap_or(trimmed);
         self.pending.body.push_str(payload);
         self.pending.body.push_str("\r\n");
-        None
+        StepOutcome {
+            reply: None,
+            accepted: None,
+        }
     }
 
     fn handle_command(&mut self, cmd: Command) -> Reply {
