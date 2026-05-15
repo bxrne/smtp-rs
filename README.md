@@ -12,9 +12,6 @@ cargo build
 
 ## Running the example server
 
-The bundled `smtp-example` binary starts a broker on `127.0.0.1:2525` that
-greets every connection with `220 Service ready` (per RFC 821).
-
 ```sh
 cargo run --bin smtp-example
 ```
