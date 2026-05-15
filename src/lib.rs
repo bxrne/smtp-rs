@@ -7,4 +7,5 @@
 
 pub mod libsmtp;
 
+pub use libsmtp::{Broker, Session};
 pub use libsmtp::{Error, Result};
