@@ -1,6 +1,6 @@
 # smtp-rs
 
-Implementation of the SMTP protocol in Rust. This library provides a simple and efficient way to send emails using the SMTP protocol.
+Implementation of the SMTP protocol in Rust. This crate provides a library (`smtp-rs`) with the protocol building blocks, plus two binaries built on top of it: minimal client and server.
 
 Aiming for compliance with [RFC 821](https://www.rfc-editor.org/pdfrfc/rfc821.txt.pdf).
 
@@ -10,19 +10,23 @@ Aiming for compliance with [RFC 821](https://www.rfc-editor.org/pdfrfc/rfc821.tx
 cargo build
 ```
 
-## Running the example server
+## Running the server
 
 ```sh
-cargo run --bin example
+cargo run --bin server
 ```
 
-The server will block, accepting connections until you stop it with `Ctrl+C`.
+The server will block, accepting connections until you stop it with `Ctrl+C`. Each accepted mail is printed to stdout.
 
-## Running the transport demo (prints accepted mail)
+## Running the client
+
+With the server running in another terminal:
 
 ```sh
-cargo run --bin nc_transport
+cargo run --bin client
 ```
+
+The client connects to `127.0.0.1:2525`, performs a full SMTP transaction (`HELO`/`MAIL`/`RCPT`/`DATA`/`QUIT`), and prints the server replies.
 
 ## Roadmap
 
@@ -47,10 +51,10 @@ cargo test
 
 ### Integration testing with `netcat`
 
-In one terminal, start the transport demo server:
+In one terminal, start the server:
 
 ```sh
-cargo run --bin nc_transport
+cargo run --bin server
 ```
 
 In another terminal, send a full SMTP transaction:
