@@ -1,22 +1,36 @@
 use smtp_rs::{Broker, Mail, Result, Transport};
 use std::sync::Arc;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Default)]
 struct StdoutTransport;
 
 impl Transport for StdoutTransport {
     fn deliver(&self, mail: Mail) -> Result<()> {
-        println!("--- accepted mail ---");
-        println!("from: {}", mail.from);
-        println!("to: {:?}", mail.to);
-        println!("body:\n{}", mail.body);
+        info!(
+            from = %mail.from,
+            to = ?mail.to,
+            body = %mail.body,
+            "accepted mail"
+        );
         Ok(())
     }
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
+
 fn main() -> Result<()> {
-    println!("SMTP server listening on 127.0.0.1:2525");
-    let broker = Broker::new_with_transport("127.0.0.1:2525", Arc::new(StdoutTransport))?;
+    init_tracing();
+    let addr = "127.0.0.1:2525";
+    info!(%addr, "SMTP server listening");
+    let broker = Broker::new_with_transport(addr, Arc::new(StdoutTransport))?;
     broker.accept()
 }
 
@@ -57,5 +71,13 @@ mod tests {
         let addr = broker.local_addr().expect("should have local addr");
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert!(addr.port() > 0);
+    }
+
+    // GIVEN init_tracing is called twice WHEN the second call runs
+    // THEN it does not panic because try_init swallows the already-set error
+    #[test]
+    fn test_init_tracing_is_idempotent() {
+        init_tracing();
+        init_tracing();
     }
 }
