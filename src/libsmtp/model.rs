@@ -43,26 +43,44 @@ impl Command {
     /// Parse a single command line (CRLF stripping is handled).
     pub fn parse(line: &str) -> Self {
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        let verb = parts.next().unwrap_or("").to_ascii_uppercase();
-        let arg = parts.next().unwrap_or("").trim();
-        match verb.as_str() {
-            "HELO" => Command::Helo(arg.to_string()),
-            "EHLO" => Command::Ehlo(arg.to_string()),
-            "MAIL" => Command::Mail(strip_path_prefix(arg, "FROM:")),
-            "RCPT" => Command::Rcpt(strip_path_prefix(arg, "TO:")),
-            "DATA" => Command::Data,
-            "RSET" => Command::Rset,
-            "NOOP" => Command::Noop,
-            "QUIT" => Command::Quit,
-            "VRFY" => Command::Vrfy(arg.to_string()),
-            "EXPN" => Command::Expn(arg.to_string()),
-            "HELP" => Command::Help(if arg.is_empty() {
+        let split_at = trimmed
+            .as_bytes()
+            .iter()
+            .position(|b| b.is_ascii_whitespace());
+
+        let (verb, arg) = match split_at {
+            Some(i) => (trimmed[..i].trim(), trimmed[i + 1..].trim()),
+            None => (trimmed, ""),
+        };
+
+        if verb.eq_ignore_ascii_case("HELO") {
+            Command::Helo(arg.to_string())
+        } else if verb.eq_ignore_ascii_case("EHLO") {
+            Command::Ehlo(arg.to_string())
+        } else if verb.eq_ignore_ascii_case("MAIL") {
+            Command::Mail(strip_path_prefix(arg, "FROM:"))
+        } else if verb.eq_ignore_ascii_case("RCPT") {
+            Command::Rcpt(strip_path_prefix(arg, "TO:"))
+        } else if verb.eq_ignore_ascii_case("DATA") {
+            Command::Data
+        } else if verb.eq_ignore_ascii_case("RSET") {
+            Command::Rset
+        } else if verb.eq_ignore_ascii_case("NOOP") {
+            Command::Noop
+        } else if verb.eq_ignore_ascii_case("QUIT") {
+            Command::Quit
+        } else if verb.eq_ignore_ascii_case("VRFY") {
+            Command::Vrfy(arg.to_string())
+        } else if verb.eq_ignore_ascii_case("EXPN") {
+            Command::Expn(arg.to_string())
+        } else if verb.eq_ignore_ascii_case("HELP") {
+            Command::Help(if arg.is_empty() {
                 None
             } else {
                 Some(arg.to_string())
-            }),
-            other => Command::Unknown(other.to_string()),
+            })
+        } else {
+            Command::Unknown(verb.to_ascii_uppercase())
         }
     }
 }
@@ -170,7 +188,7 @@ impl Machine {
     /// Drive the machine and return any accepted mail when DATA completes.
     pub fn step_with_mail(&mut self, line: &str) -> StepOutcome {
         if self.state == State::Data {
-            return self.handle_data_line(line);
+            return self.handle_data_line(line, true);
         }
         StepOutcome {
             reply: Some(self.handle_command(Command::parse(line))),
@@ -178,11 +196,26 @@ impl Machine {
         }
     }
 
-    fn handle_data_line(&mut self, line: &str) -> StepOutcome {
+    /// Drive the machine and return accepted mail without recording `last`.
+    ///
+    /// Useful for hot paths that do not need test/debug last-message tracking.
+    pub fn step_with_mail_no_last(&mut self, line: &str) -> StepOutcome {
+        if self.state == State::Data {
+            return self.handle_data_line(line, false);
+        }
+        StepOutcome {
+            reply: Some(self.handle_command(Command::parse(line))),
+            accepted: None,
+        }
+    }
+
+    fn handle_data_line(&mut self, line: &str, record_last: bool) -> StepOutcome {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed == "." {
             let mail = std::mem::take(&mut self.pending);
-            self.last = Some(mail.clone());
+            if record_last {
+                self.last = Some(mail.clone());
+            }
             self.state = State::Helo;
             return StepOutcome {
                 reply: Some(Reply::new(250, "OK message accepted")),

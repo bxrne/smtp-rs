@@ -30,12 +30,8 @@ impl Session {
     /// Drive the SMTP state machine over this connection until the client
     /// issues `QUIT` or the connection is closed.
     pub fn handle(&mut self) -> Result<()> {
-        let peer = self
-            .stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string());
-        let span = info_span!("session", %peer);
+        let peer = self.stream.peer_addr().ok();
+        let span = info_span!("session", peer = ?peer);
         let _enter = span.enter();
 
         let started = Instant::now();
@@ -51,11 +47,19 @@ impl Session {
             .stream
             .try_clone()
             .map_err(|e| Error::SessionError(e.to_string()))?;
-        let reader = BufReader::new(read_stream);
+        let mut reader = BufReader::new(read_stream);
 
-        for line in reader.lines() {
-            let line = line.map_err(|e| Error::SessionError(e.to_string()))?;
-            let outcome = machine.step_with_mail(&line);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .map_err(|e| Error::SessionError(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+
+            let outcome = machine.step_with_mail_no_last(&line);
             if let Some(mail) = outcome.accepted {
                 mails += 1;
                 self.transport.deliver(mail)?;
@@ -131,20 +135,17 @@ impl Broker {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let peer = stream
-                        .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    let peer = stream.peer_addr().ok();
                     let transport = self.transport.clone();
-                    debug!(%peer, "accepted connection");
+                    debug!(peer = ?peer, "accepted connection");
                     thread::Builder::new()
-                        .name(format!("smtp-session-{peer}"))
+                        .name("smtp-session".to_string())
                         .spawn(move || {
                             let mut session = Session::new(stream, transport);
                             if let Err(e) = session.handle() {
-                                warn!(%peer, error = %e, "session ended with error");
+                                warn!(peer = ?peer, error = %e, "session ended with error");
                             } else {
-                                debug!(%peer, "session ended");
+                                debug!(peer = ?peer, "session ended");
                             }
                         })
                         .map_err(|e| Error::SessionError(e.to_string()))?;

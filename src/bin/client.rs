@@ -1,14 +1,41 @@
+use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
-use tracing::{debug, error, info, info_span, instrument, warn};
+use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
 
 const ADDR: &str = "127.0.0.1:2525";
+
+#[derive(Debug)]
+struct Payloads {
+    small: String,
+    medium: String,
+    large: String,
+}
+
+impl Payloads {
+    fn load() -> std::io::Result<Self> {
+        let samples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples");
+        Ok(Self {
+            small: fs::read_to_string(samples_dir.join("small.txt"))?,
+            medium: fs::read_to_string(samples_dir.join("medium.txt"))?,
+            large: fs::read_to_string(samples_dir.join("large.txt"))?,
+        })
+    }
+
+    fn pick(&self, worker_id: usize, trial: usize) -> &str {
+        match (worker_id + trial) % 3 {
+            0 => self.small.as_str(),
+            1 => self.medium.as_str(),
+            _ => self.large.as_str(),
+        }
+    }
+}
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -19,15 +46,30 @@ fn init_tracing() {
 }
 
 fn send<W: Write, R: BufRead>(writer: &mut W, reader: &mut R, line: &str) -> std::io::Result<()> {
+    let mut resp = String::new();
+    send_with_buf(writer, reader, line, &mut resp)
+}
+
+fn send_with_buf<W: Write, R: BufRead>(
+    writer: &mut W,
+    reader: &mut R,
+    line: &str,
+    resp: &mut String,
+) -> std::io::Result<()> {
     writer.write_all(line.as_bytes())?;
     writer.write_all(b"\r\n")?;
     writer.flush()?;
-    read_reply(reader)
+    read_reply_with_buf(reader, resp)
 }
 
 fn read_reply<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
     let mut resp = String::new();
-    reader.read_line(&mut resp)?;
+    read_reply_with_buf(reader, &mut resp)
+}
+
+fn read_reply_with_buf<R: BufRead>(reader: &mut R, resp: &mut String) -> std::io::Result<()> {
+    resp.clear();
+    reader.read_line(resp)?;
     debug!(reply = %resp.trim_end(), "server reply");
     Ok(())
 }
@@ -36,10 +78,10 @@ fn subject_for(worker_id: usize, trial: usize) -> String {
     format!("smtp-rs client worker={worker_id} trial={trial}")
 }
 
-#[instrument(skip(addr), fields(addr = %addr))]
-fn run_one(addr: &str, worker_id: usize, trial: usize) -> std::io::Result<()> {
+fn run_one(addr: &str, worker_id: usize, trial: usize, payloads: &Payloads) -> std::io::Result<()> {
     let started = Instant::now();
     let stream = TcpStream::connect(addr)?;
+    let _ = stream.set_nodelay(true);
     debug!(
         connect_ms = started.elapsed().as_millis() as u64,
         "connected"
@@ -47,20 +89,36 @@ fn run_one(addr: &str, worker_id: usize, trial: usize) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
-    read_reply(&mut reader)?;
+    let mut reply_buf = String::new();
+    read_reply_with_buf(&mut reader, &mut reply_buf)?;
 
-    send(&mut writer, &mut reader, "HELO localhost")?;
-    send(&mut writer, &mut reader, "MAIL FROM:<sender@example.com>")?;
-    send(&mut writer, &mut reader, "RCPT TO:<recipient@example.com>")?;
-    send(&mut writer, &mut reader, "DATA")?;
+    send_with_buf(&mut writer, &mut reader, "HELO localhost", &mut reply_buf)?;
+    send_with_buf(
+        &mut writer,
+        &mut reader,
+        "MAIL FROM:<sender@example.com>",
+        &mut reply_buf,
+    )?;
+    send_with_buf(
+        &mut writer,
+        &mut reader,
+        "RCPT TO:<recipient@example.com>",
+        &mut reply_buf,
+    )?;
+    send_with_buf(&mut writer, &mut reader, "DATA", &mut reply_buf)?;
 
-    let subject = subject_for(worker_id, trial);
-    let body = format!("Subject: {subject}\r\n\r\nworker={worker_id} trial={trial}\r\n.\r\n");
-    writer.write_all(body.as_bytes())?;
+    let payload = payloads.pick(worker_id, trial);
+
+    write!(
+        writer,
+        "Subject: smtp-rs client worker={worker_id} trial={trial}\r\n\r\nworker={worker_id} trial={trial}\r\n"
+    )?;
+    writer.write_all(payload.as_bytes())?;
+    writer.write_all(b"\r\n.\r\n")?;
     writer.flush()?;
-    read_reply(&mut reader)?;
+    read_reply_with_buf(&mut reader, &mut reply_buf)?;
 
-    send(&mut writer, &mut reader, "QUIT")?;
+    send_with_buf(&mut writer, &mut reader, "QUIT", &mut reply_buf)?;
     debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "transaction complete"
@@ -129,33 +187,28 @@ where
     Ok(Args { trials, workers })
 }
 
-fn run_workload(addr: &'static str, args: &Args) -> (usize, usize) {
-    let success = Arc::new(AtomicUsize::new(0));
-    let failure = Arc::new(AtomicUsize::new(0));
+fn run_workload(addr: &'static str, args: &Args, payloads: Arc<Payloads>) -> (usize, usize) {
     let trials = args.trials;
 
     let handles: Vec<_> = (0..args.workers)
         .map(|worker_id| {
-            let success = Arc::clone(&success);
-            let failure = Arc::clone(&failure);
+            let payloads = payloads.clone();
             thread::Builder::new()
                 .name(format!("worker-{worker_id}"))
                 .spawn(move || {
                     let span = info_span!("worker", worker_id);
                     let _enter = span.enter();
                     let started = Instant::now();
-                    let mut local_ok = 0u64;
-                    let mut local_err = 0u64;
+                    let mut local_ok = 0usize;
+                    let mut local_err = 0usize;
                     for trial in 0..trials {
-                        match run_one(addr, worker_id, trial) {
+                        match run_one(addr, worker_id, trial, &payloads) {
                             Ok(()) => {
                                 local_ok += 1;
-                                success.fetch_add(1, Ordering::Relaxed);
                                 debug!(trial, "trial ok");
                             }
                             Err(err) => {
                                 local_err += 1;
-                                failure.fetch_add(1, Ordering::Relaxed);
                                 warn!(
                                     trial,
                                     error = %format_error(addr, &err),
@@ -170,19 +223,27 @@ fn run_workload(addr: &'static str, args: &Args) -> (usize, usize) {
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "worker complete"
                     );
+                    (local_ok, local_err)
                 })
                 .expect("spawn worker thread")
         })
         .collect();
 
+    let mut success = 0usize;
+    let mut failure = 0usize;
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok((local_ok, local_err)) => {
+                success += local_ok;
+                failure += local_err;
+            }
+            Err(_) => {
+                failure += trials;
+            }
+        }
     }
 
-    (
-        success.load(Ordering::Relaxed),
-        failure.load(Ordering::Relaxed),
-    )
+    (success, failure)
 }
 
 fn main() -> ExitCode {
@@ -196,6 +257,14 @@ fn main() -> ExitCode {
         }
     };
 
+    let payloads = match Payloads::load() {
+        Ok(payloads) => Arc::new(payloads),
+        Err(err) => {
+            error!(error = %err, "failed to load payload samples from samples/");
+            return ExitCode::FAILURE;
+        }
+    };
+
     info!(
         trials = args.trials,
         workers = args.workers,
@@ -205,7 +274,7 @@ fn main() -> ExitCode {
     );
 
     let started = Instant::now();
-    let (success, failure) = run_workload(ADDR, &args);
+    let (success, failure) = run_workload(ADDR, &args, payloads);
     let elapsed = started.elapsed();
 
     info!(
@@ -226,6 +295,14 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn test_payloads() -> Arc<Payloads> {
+        Arc::new(Payloads {
+            small: "small sample".to_string(),
+            medium: "medium sample".to_string(),
+            large: "large sample".to_string(),
+        })
+    }
 
     // GIVEN a command WHEN send writes it THEN the bytes are line-terminated with CRLF
     #[test]
@@ -370,7 +447,7 @@ mod tests {
             trials: 0,
             workers: 4,
         };
-        let (success, failure) = run_workload("127.0.0.1:1", &args);
+        let (success, failure) = run_workload("127.0.0.1:1", &args, test_payloads());
         assert_eq!(success, 0);
         assert_eq!(failure, 0);
     }
@@ -384,7 +461,7 @@ mod tests {
             trials: 2,
             workers: 3,
         };
-        let (success, failure) = run_workload("127.0.0.1:1", &args);
+        let (success, failure) = run_workload("127.0.0.1:1", &args, test_payloads());
         assert_eq!(success, 0);
         assert_eq!(failure, 6);
     }
@@ -459,7 +536,7 @@ mod tests {
             tx.send(captured).expect("send captured");
         });
 
-        run_one(&addr_string, 3, 11).expect("client transaction");
+        run_one(&addr_string, 3, 11, &test_payloads()).expect("client transaction");
 
         server_handle.join().expect("server thread join");
         let captured = rx.recv().expect("captured body");
