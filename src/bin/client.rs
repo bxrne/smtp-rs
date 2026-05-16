@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, instrument, warn};
 use tracing_subscriber::EnvFilter;
 
 const ADDR: &str = "127.0.0.1:2525";
@@ -36,8 +36,14 @@ fn subject_for(worker_id: usize, trial: usize) -> String {
     format!("smtp-rs client worker={worker_id} trial={trial}")
 }
 
+#[instrument(skip(addr), fields(addr = %addr))]
 fn run_one(addr: &str, worker_id: usize, trial: usize) -> std::io::Result<()> {
+    let started = Instant::now();
     let stream = TcpStream::connect(addr)?;
+    debug!(
+        connect_ms = started.elapsed().as_millis() as u64,
+        "connected"
+    );
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
@@ -55,6 +61,10 @@ fn run_one(addr: &str, worker_id: usize, trial: usize) -> std::io::Result<()> {
     read_reply(&mut reader)?;
 
     send(&mut writer, &mut reader, "QUIT")?;
+    debug!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "transaction complete"
+    );
     Ok(())
 }
 
@@ -128,20 +138,40 @@ fn run_workload(addr: &'static str, args: &Args) -> (usize, usize) {
         .map(|worker_id| {
             let success = Arc::clone(&success);
             let failure = Arc::clone(&failure);
-            thread::spawn(move || {
-                for trial in 0..trials {
-                    match run_one(addr, worker_id, trial) {
-                        Ok(()) => {
-                            success.fetch_add(1, Ordering::Relaxed);
-                            debug!(worker_id, trial, "trial ok");
-                        }
-                        Err(err) => {
-                            failure.fetch_add(1, Ordering::Relaxed);
-                            warn!(worker_id, trial, error = %format_error(addr, &err), "trial failed");
+            thread::Builder::new()
+                .name(format!("worker-{worker_id}"))
+                .spawn(move || {
+                    let span = info_span!("worker", worker_id);
+                    let _enter = span.enter();
+                    let started = Instant::now();
+                    let mut local_ok = 0u64;
+                    let mut local_err = 0u64;
+                    for trial in 0..trials {
+                        match run_one(addr, worker_id, trial) {
+                            Ok(()) => {
+                                local_ok += 1;
+                                success.fetch_add(1, Ordering::Relaxed);
+                                debug!(trial, "trial ok");
+                            }
+                            Err(err) => {
+                                local_err += 1;
+                                failure.fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    trial,
+                                    error = %format_error(addr, &err),
+                                    "trial failed"
+                                );
+                            }
                         }
                     }
-                }
-            })
+                    info!(
+                        ok = local_ok,
+                        err = local_err,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "worker complete"
+                    );
+                })
+                .expect("spawn worker thread")
         })
         .collect();
 

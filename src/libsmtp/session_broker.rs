@@ -12,7 +12,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
-use tracing::{debug, warn};
+use std::time::Instant;
+use tracing::{debug, info, info_span, warn};
 
 /// Handler for individual TCP sessions.
 pub struct Session {
@@ -29,8 +30,21 @@ impl Session {
     /// Drive the SMTP state machine over this connection until the client
     /// issues `QUIT` or the connection is closed.
     pub fn handle(&mut self) -> Result<()> {
+        let peer = self
+            .stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let span = info_span!("session", %peer);
+        let _enter = span.enter();
+
+        let started = Instant::now();
+        let mut commands: u64 = 0;
+        let mut mails: u64 = 0;
+
         let mut machine = Machine::new();
         let greeting = machine.greet();
+        debug!(code = greeting.code, "greeting");
         self.write_reply(&greeting)?;
 
         let read_stream = self
@@ -43,15 +57,29 @@ impl Session {
             let line = line.map_err(|e| Error::SessionError(e.to_string()))?;
             let outcome = machine.step_with_mail(&line);
             if let Some(mail) = outcome.accepted {
+                mails += 1;
                 self.transport.deliver(mail)?;
             }
             if let Some(reply) = outcome.reply {
+                commands += 1;
+                debug!(
+                    line = %line.trim_end_matches(['\r', '\n']),
+                    code = reply.code,
+                    "processed command"
+                );
                 self.write_reply(&reply)?;
             }
             if machine.is_closed() {
                 break;
             }
         }
+
+        info!(
+            commands,
+            mails,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "session complete"
+        );
 
         Ok(())
     }
