@@ -11,6 +11,8 @@ use crate::libsmtp::transport::{NullTransport, Transport};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::thread;
+use tracing::{debug, warn};
 
 /// Handler for individual TCP sessions.
 pub struct Session {
@@ -93,13 +95,31 @@ impl Broker {
             .map_err(|e| Error::SessionError(e.to_string()))
     }
 
-    /// Accept incoming connections and handle sessions sequentially.
+    /// Accept incoming connections and handle each session on its own thread.
+    ///
+    /// Per-session errors are logged via `tracing::warn` and do not stop the
+    /// broker; only failures of the accept call itself are fatal.
     pub fn accept(&self) -> Result<()> {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let mut session = Session::new(stream, self.transport.clone());
-                    session.handle()?;
+                    let peer = stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    let transport = self.transport.clone();
+                    debug!(%peer, "accepted connection");
+                    thread::Builder::new()
+                        .name(format!("smtp-session-{peer}"))
+                        .spawn(move || {
+                            let mut session = Session::new(stream, transport);
+                            if let Err(e) = session.handle() {
+                                warn!(%peer, error = %e, "session ended with error");
+                            } else {
+                                debug!(%peer, "session ended");
+                            }
+                        })
+                        .map_err(|e| Error::SessionError(e.to_string()))?;
                 }
                 Err(e) => return Err(Error::SessionError(e.to_string())),
             }
@@ -233,6 +253,65 @@ mod tests {
             .join()
             .expect("session thread should join")
             .expect("session should complete cleanly");
+    }
+
+    // GIVEN a broker accepting in a background thread WHEN two clients connect concurrently
+    // THEN both receive their greeting without one having to finish first.
+    // This catches the regression of a single-threaded accept loop, where the
+    // second client's greeting would block until the first client's session ends.
+    #[test]
+    fn test_broker_handles_concurrent_sessions() {
+        let broker = Broker::new("127.0.0.1:0").expect("broker should bind");
+        let addr = broker.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let _ = broker.accept();
+        });
+
+        let mut c1 = TcpStream::connect(addr).expect("c1 connect");
+        let mut c2 = TcpStream::connect(addr).expect("c2 connect");
+        c1.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("c1 read timeout");
+        c2.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("c2 read timeout");
+
+        // c1 stays silent on purpose. With a single-threaded broker this would
+        // block c2 from ever receiving its greeting and the read would time
+        // out. With per-session threads, c2's greeting arrives immediately.
+        let mut b2 = [0u8; 64];
+        let n2 = c2.read(&mut b2).expect("c2 should receive greeting");
+        assert_eq!(&b2[..n2], b"220 Service ready\r\n");
+
+        let mut b1 = [0u8; 64];
+        let n1 = c1.read(&mut b1).expect("c1 should receive greeting");
+        assert_eq!(&b1[..n1], b"220 Service ready\r\n");
+    }
+
+    // GIVEN a broker accepting in a background thread WHEN a session errors
+    // THEN subsequent sessions still succeed (the broker stays alive).
+    #[test]
+    fn test_broker_survives_session_errors() {
+        let broker = Broker::new("127.0.0.1:0").expect("broker should bind");
+        let addr = broker.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let _ = broker.accept();
+        });
+
+        // First client connects and immediately drops, simulating an aborted
+        // session (its handle() will hit EOF / connection-reset).
+        {
+            let bad = TcpStream::connect(addr).expect("bad client connect");
+            drop(bad);
+        }
+
+        // The broker must still be accepting.
+        let mut good = TcpStream::connect(addr).expect("good client connect");
+        good.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set read timeout");
+        let mut buf = [0u8; 64];
+        let n = good
+            .read(&mut buf)
+            .expect("good client should receive greeting");
+        assert_eq!(&buf[..n], b"220 Service ready\r\n");
     }
 
     // GIVEN a connected client WHEN it sends an unknown command
